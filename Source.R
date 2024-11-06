@@ -9,6 +9,7 @@ library(dplyr)
 library(leaflet)
 library(sf)
 library(shiny)
+library(lubridate)
 
 # Keep lat, long, date, wind speed, wind radius, year, iso_time
 # Keep wind speeds in km
@@ -27,6 +28,7 @@ hurricanes_1 <- hurricanes_1_raw %>%
          wind_speed = ...15,
          ) %>%
   mutate(name = as.factor(name),
+         date = as.Date(parse_date_time2(date, orders = "mdy HM", cutoff_2000 = 24)),
          hurricanes_in_year = as.numeric(hurricanes_in_year),
          latitude = as.numeric(latitude),
          longitude = as.numeric(longitude),
@@ -72,6 +74,7 @@ hurricanes_2 <- hurricanes_2_raw %>%
          wind_radius = ...11,
          quadrant = ...9) %>%
   mutate(name = as.factor(name),
+         date = as.Date(parse_date_time2(date, orders = "mdy HM", cutoff_2000 = 24)),
          quadrant = as.factor(quadrant),
          latitude = as.numeric(latitude),
          longitude = as.numeric(longitude),
@@ -135,7 +138,7 @@ duplicate_rows <- exposures %>%
   ungroup()
 
 #'
-#' Combining 
+#' Combining hurricane data
 #'
 
 combined_hurricanes <- inner_join(hurricanes_1, hurricanes_2, by = c("name", "date", "longitude", "latitude"))
@@ -152,94 +155,15 @@ write_csv(combined_hurricanes, "combined_hurricanes.csv")
 #' Creating the interactive map for huuricane 1 data
 #'
 
-hurricanes_1_basemap <- leaflet(data = hurricanes_2_alberto_centers) %>%
-  addTiles() %>% 
-  addCircleMarkers(
-    clusterOptions = markerClusterOptions(),
-    lng = ~longitude,
-    lat = ~latitude,
-    label = ~name,
-    radius = 5,
-    color = 'red',
-    stroke = FALSE, fillOpacity = 0.75
-  )
-
 #'
-#' Creating the interactive map for the hurricane data
+#' Creating the interactive map for the hurricane 2 data
 #'
 
-# Create a palette that maps factor levels to colors
-pal <- colorFactor(c("black", "red"), domain = c("location", "storm_center"))
-
-hurricanes_2_centers <- hurricanes_2 %>%
-  distinct(name, latitude, longitude, .keep_all = TRUE)
-
-
-hurricanes_2_alberto_centers <- hurricanes_2 %>%
-  filter(name == 'ALBERTO')
-
-basemap <- leaflet(data = hurricanes_2_alberto_centers) %>%
-  addTiles() %>% 
-  addCircleMarkers(
-    lng = ~longitude,
-    lat = ~latitude,
-    label = ~name,
-    radius = 2,
-    color = 'red',
-    stroke = FALSE, fillOpacity = 1
-  )
-
-hurricanes_2_no_nil <- hurricanes_2 %>%
-  filter(wind_radius != 0) %>%
-  mutate(wind_radius_lng = round(
-    ifelse(quadrant == 'nw' | quadrant == 'sw', 
-           longitude - sqrt(2) * wind_radius/(12742), 
-           longitude + sqrt(2) * wind_radius/(12742))
-    , digit = 5),
-    wind_radius_lat = round(
-      ifelse(quadrant == 'sw' | quadrant == 'se', 
-             latitude - sqrt(2) * wind_radius/(12742), 
-             latitude + sqrt(2) * wind_radius/(12742))
-      , digit = 5))
-
-hurricanes_2_no_nil_alberto <- hurricanes_2_no_nil %>%
-  filter(name == 'ALBERTO')
-
-hurricanes_2_alberto <- hurricanes_2 %>%
-  filter(name == 'ALBERTO') %>%
-  mutate(wind_radius_lng = round(
-    ifelse(quadrant == 'nw' | quadrant == 'sw', 
-           longitude - sqrt(2) * wind_radius/(12742), 
-           longitude + sqrt(2) * wind_radius/(12742))
-    , digit = 5),
-    wind_radius_lat = round(
-      ifelse(quadrant == 'sw' | quadrant == 'se', 
-             latitude - sqrt(2) * wind_radius/(12742), 
-             latitude + sqrt(2) * wind_radius/(12742))
-      , digit = 5))
-
-polygons_sf <- hurricanes_2_alberto %>%
-  group_by(name, date, latitude, longitude, wind_speed) %>%
-  summarise(geometry = list(cbind(wind_radius_lng, wind_radius_lat)))
-
-# Apply a buffer for rounded corners (adjust the 'dist' for more rounding)
-rounded_polygons <- st_buffer(polygons_sf, dist = 0.0005)
-
-basemap <- basemap %>%
-  addPolygons(
-    data = drivetime,
-    # set the color of the polygon
-    color = "#E84A5F",
-    # set the opacity of the outline
-    opacity = 1,
-    # set the stroke width in pixels
-    weight = 1,
-    # set the fill opacity
-    fillOpacity = 0.6
-  )
-
-basemap
-
+hurricanes_2_average_wind_radius <- hurricanes_2 %>%
+  group_by(name, date, longitude, latitude, wind_speed) %>%
+  mutate(avg_wind_radius = mean(wind_radius)) %>%
+  ungroup() %>%
+  distinct(name, date, latitude, longitude, wind_speed, .keep_all = TRUE)
 
 #'
 #' Making a shiny ui for project
@@ -247,10 +171,25 @@ basemap
 
 # Define ui
 ui <- fluidPage(
-  titlePanel("Leaflet Map Display"),
+  titlePanel("Hurricane Map Display"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("name", "Select Name:", choices = unique(hurricanes_2$name)),
+      selectInput(
+        "names", 
+        "Select Hurricanes:",
+        choices = c('ALL Hurricanes', as.character(unique(hurricanes_2$name))),
+        multiple = TRUE
+      ),
+      sliderInput("year", 
+                  "Select Years:",
+                  min = min(hurricanes_2$date), 
+                  max = max(hurricanes_2$date), 
+                  value = c(min(hurricanes_2$date), max(hurricanes_2$date))),
+      h4('Enter proposed location: '),
+      numericInput("longitude", "Longitude", value = 0),  # Default value for longitude
+      numericInput("latitude", "Latitude", value = 0),
+      actionButton("add_location", "Add Location"),
+      actionButton("clear_locations", "Clear Locations")
     ),
     mainPanel(
       leafletOutput("map")
@@ -262,21 +201,71 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   # Create the leaflet map and render it when the button is pressed
   output$map <- renderLeaflet({
-    selected_data <- hurricanes_2 %>%
-      distinct(name, latitude, longitude, .keep_all = TRUE) %>%
-      filter(name == input$name)
+    if('ALL Hurricanes' %in% input$names) {
+      selected_data <- hurricanes_2_average_wind_radius
+    } else {
+      selected_data <- hurricanes_2_average_wind_radius %>%
+        filter(name %in% input$names)
+    }
+    selected_data <- selected_data %>%
+      filter(date >= input$year[1],
+             date <= input$year[2])
     
-    leaflet(data = selected_data) %>%
+    leaflet(selected_data) %>%
       addTiles() %>% 
-      addCircleMarkers(
-        #clusterOptions = markerClusterOptions(),
+      addCircles(
+        data = selected_data %>% filter(wind_speed == 34),
         lng = ~longitude,
         lat = ~latitude,
-        label = ~name,
-        radius = 2,
-        color = 'red',
-        stroke = FALSE, fillOpacity = 1
-      )
+        radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
+        color = "",   # Circle color
+        fillColor = "#4cff00",  # Fill color of the circle
+        fillOpacity = 0.3,  # Opacity of the circle fill
+        opacity = 0.3
+      ) %>%
+      addCircles(
+        data = selected_data %>% filter(wind_speed == 50),
+        lng = ~longitude, 
+        lat = ~latitude, 
+        radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
+        color = "",   # Circle color
+        fillColor = "#fffe21",  # Fill color of the circle
+        fillOpacity = 0.3,  # Opacity of the circle fill
+        opacity = 0.3
+      ) %>%
+      addCircles(
+        data = selected_data %>% filter(wind_speed == 64),
+        lng = ~longitude, 
+        lat = ~latitude, 
+        radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
+        color = "",   # Circle color
+        fillColor = "#ff2121",  # Fill color of the circle
+        fillOpacity = 0.3,  # Opacity of the circle fill
+        opacity = 0.3
+      ) %>%
+      addTiles()
+      # %>%
+      # addCircleMarkers(
+      #   #clusterOptions = markerClusterOptions(),
+      #   lng = ~longitude,
+      #   lat = ~latitude,
+      #   label = ~name,
+      #   radius = 2,
+      #   color = 'red',
+      #   stroke = FALSE, fillOpacity = 1
+      # ) 
+  })
+  
+  # Adding Locations
+  observeEvent(input$add_location, {
+    leafletProxy("map") %>% 
+      addCircleMarkers(lng = input$longitude, lat = input$latitude)  # Add location on map
+  })
+  
+  # Removing Locations 
+  observeEvent(input$clear_locations, {
+    leafletProxy("map") %>% 
+      clearMarkers()  # Clear previous locations
   })
 }
 
