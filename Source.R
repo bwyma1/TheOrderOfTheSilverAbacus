@@ -37,6 +37,9 @@ hurricanes_1 <- hurricanes_1_raw %>%
          ) %>%
   select(c(name, date, longitude, latitude, wind_speed, hurricanes_in_year))
 
+hurricanes_1 <- hurricanes_1 %>%
+  mutate(year = year(date))
+
 hurricanes_1 <- hurricanes_1[-c(1, 2), ]
 
 # There are no NA rows. 
@@ -137,6 +140,47 @@ duplicate_rows <- exposures %>%
   filter(n() > 1) %>%
   ungroup()
 
+# Adding column to exposures with the number of hurricanes within 1 degree of lat/lon of hurricane
+exposures <- exposures %>%
+  rowwise() %>%
+  mutate(
+    nearby_hurricanes =
+      hurricanes_1 %>%
+        filter(policy_year == .data$year) %>%
+        filter(abs(latitude - .data$latitude) < 1 & abs(longitude - .data$longitude) < 1) %>%
+        distinct(name, .keep_all = TRUE) %>%
+        nrow()
+    
+  ) %>%
+  ungroup()
+
+# Creating a running average column for loss ratio
+exposures <- exposures %>%
+  arrange(location_id, policy_year) %>%
+  group_by(location_id) %>%
+  mutate(
+    cum_loss_ratio = cummean(losses_non_catastrophe)/cummean(premium) * 100
+  ) %>%
+  ungroup()
+
+# Creating a premium/100$ of total insured value column
+exposures <- exposures %>%
+  mutate(premium_per_100_total_insured_value = premium/(total_insured_value/100))
+
+# Creating loss cost column
+exposures <- exposures %>%
+  arrange(location_id, policy_year) %>%
+  group_by(location_id) %>%
+  mutate(
+    cum_loss_cost_ratio = cummean(losses_non_catastrophe)/total_insured_value * 100
+  ) %>%
+  ungroup()
+
+write_csv(exposures, 'exposures.csv')
+
+exposures_id <- exposures %>%
+  filter(location_id == 1)
+
 #'
 #' Combining hurricane data
 #'
@@ -171,28 +215,52 @@ hurricanes_2_average_wind_radius <- hurricanes_2 %>%
 
 # Define ui
 ui <- fluidPage(
-  titlePanel("Hurricane Map Display"),
-  sidebarLayout(
-    sidebarPanel(
-      selectInput(
-        "names", 
-        "Select Hurricanes:",
-        choices = c('ALL Hurricanes', as.character(unique(hurricanes_2$name))),
-        multiple = TRUE
-      ),
-      sliderInput("year", 
-                  "Select Years:",
-                  min = min(hurricanes_2$date), 
-                  max = max(hurricanes_2$date), 
-                  value = c(min(hurricanes_2$date), max(hurricanes_2$date))),
-      h4('Enter proposed location: '),
-      numericInput("longitude", "Longitude", value = 0),  # Default value for longitude
-      numericInput("latitude", "Latitude", value = 0),
-      actionButton("add_location", "Add Location"),
-      actionButton("clear_locations", "Clear Locations")
+  titlePanel("CAS Data Visualization"),
+  tabsetPanel(
+    tabPanel(
+      title = "Hurricane Map Display",
+      sidebarLayout(
+        sidebarPanel(
+          selectInput(
+            "names", 
+            "Select Hurricanes:",
+            choices = c('ALL Hurricanes', as.character(unique(hurricanes_2$name))),
+            multiple = TRUE
+          ),
+          sliderInput("year", 
+                      "Select Years:",
+                      min = min(hurricanes_2$date), 
+                      max = max(hurricanes_2$date), 
+                      value = c(min(hurricanes_2$date), max(hurricanes_2$date))),
+          h4('Enter proposed location: '),
+          numericInput("longitude", "Longitude", value = 0),  # Default value for longitude
+          numericInput("latitude", "Latitude", value = 0),
+          actionButton("add_location", "Add Location"),
+          actionButton("clear_locations", "Clear Locations")
+        ),
+        mainPanel(
+          leafletOutput("map")
+        )
+      )
     ),
-    mainPanel(
-      leafletOutput("map")
+    
+    tabPanel(
+      title = "Property Portfolio",
+      sidebarLayout(
+        sidebarPanel(
+          selectInput(
+            "propertyName",
+            "Select Property:",
+            choices = sort(as.numeric(unique(exposures$location_id)))
+          )
+        ),
+        mainPanel(
+          plotOutput('plot1'),
+          plotOutput('plot2'),
+          plotOutput('plot3'),
+          plotOutput('plot4')
+        )
+      )
     )
   )
 )
@@ -267,7 +335,54 @@ server <- function(input, output, session) {
     leafletProxy("map") %>% 
       clearMarkers()  # Clear previous locations
   })
+  
+  # Plotting Property Portfolio
+  # Plotting Loss Ration Over Time
+  output$plot1 <- renderPlot({
+    exposures_id <- exposures %>%
+      filter(location_id == input$propertyName)
+    ggplot(exposures_id, aes(x = policy_year, y = cum_loss_ratio)) +
+      geom_point() +
+      geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
+      labs(x = 'Policy Year', y = 'Loss Percentage',title = paste("Change in Loss Ratio of Property Over Time")) +
+      theme_minimal()
+  })
+  
+  # Plotting the Total Insured Value Over Time
+  output$plot2 <- renderPlot({
+    exposures_id <- exposures %>%
+      filter(location_id == input$propertyName)
+    ggplot(exposures_id, aes(x = policy_year, y = total_insured_value)) +
+      geom_point() +
+      geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
+      labs(x = 'Policy Year', y = 'Total Insured Value',title = paste("Change in Total Insured Value Over Time")) +
+      theme_minimal()
+  })
+  
+  # Plotting the Premium per 100$ of total insured value over time
+  output$plot3 <- renderPlot({
+    exposures_id <- exposures %>%
+      filter(location_id == input$propertyName)
+    ggplot(exposures_id, aes(x = policy_year, y = premium_per_100_total_insured_value)) +
+      geom_point() +
+      geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
+      labs(x = 'Policy Year', y = 'Premium/100$ of Total Insured Value',title = paste("Change in Premium/100$ of Total Insured Value Over Time")) +
+      theme_minimal()
+  })
+  
+  # Plotting Change in loss cost over time
+  output$plot4 <- renderPlot({
+    exposures_id <- exposures %>%
+      filter(location_id == input$propertyName)
+    ggplot(exposures_id, aes(x = policy_year, y = cum_loss_cost_ratio)) +
+      geom_point() +
+      geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
+      labs(x = 'Policy Year', y = 'Loss Cost ',title = paste("Change in Loss Cost Ratio Over Time")) +
+      theme_minimal()
+  })
+  
 }
+
 
 
 # Run the application
