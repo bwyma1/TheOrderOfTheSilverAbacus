@@ -104,6 +104,81 @@ duplicate_rows <- hurricanes_2 %>%
   filter(n() > 1) %>%
   ungroup()
 
+print(nlevels(hurricanes_2$name))
+
+#'
+#' Imputing Hurricane 2 Data and Combining the two datasets
+#'
+
+hurricanes_2_average_wind_radius <- hurricanes_2 %>%
+  group_by(name, date, longitude, latitude, wind_speed) %>%
+  mutate(avg_wind_radius = mean(wind_radius)) %>%
+  ungroup() %>%
+  distinct(name, date, latitude, longitude, wind_speed, .keep_all = TRUE)
+
+combined_hurricanes_34 <- inner_join(hurricanes_1, hurricanes_2_average_wind_radius, by = c("name", "date", "longitude", "latitude")) %>%
+  filter(wind_speed.y == 34) 
+combined_hurricanes_50 <- inner_join(hurricanes_1, hurricanes_2_average_wind_radius, by = c("name", "date", "longitude", "latitude")) %>%
+  filter(wind_speed.y == 50) 
+combined_hurricanes_64 <- inner_join(hurricanes_1, hurricanes_2_average_wind_radius, by = c("name", "date", "longitude", "latitude")) %>%
+  filter(wind_speed.y == 64) 
+
+# Plotting Data to see what model should be used to impute data
+ggplot(combined_hurricanes_34, aes(x = wind_speed.x, y = avg_wind_radius)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = 'blue') +
+  labs(x = 'max speed', y = 'Radius ',title = paste("Wind speed/radius 34")) +
+  theme_minimal()
+ggplot(combined_hurricanes_50, aes(x = wind_speed.x, y = avg_wind_radius)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = 'blue') +
+  labs(x = 'max speed', y = 'Radius ',title = paste("Wind speed/radius 50")) +
+  theme_minimal()
+ggplot(combined_hurricanes_64, aes(x = wind_speed.x, y = avg_wind_radius)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = 'blue') +
+  labs(x = 'max speed', y = 'Radius ',title = paste("Wind speed/radius 64")) +
+  theme_minimal()
+# There is no function that fits this data well.
+# This model shows that we should probably impute by taking the average for each max wind speed.
+
+# Combine using a full join
+combined_hurricanes <- hurricanes_1  %>%
+  full_join(hurricanes_2_average_wind_radius, by = c("name", "date", "longitude", "latitude"))
+
+# Filter rows with NA in the "value" column and replicate them 3 times
+combined_hurricanes_imputed <- combined_hurricanes %>%
+  filter(is.na(wind_speed.y)) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  mutate(wind_speed.y = rep(c(34, 50, 64), times = n() / 3))
+
+# Filter out the original NA rows and bind the modified NA rows
+combined_hurricanes_imputed <- combined_hurricanes %>%
+  filter(!is.na(wind_speed.y)) %>%
+  bind_rows(combined_hurricanes_imputed) %>%
+  arrange(date)
+  
+# Filter out unwanted columns and rename columns
+combined_hurricanes_imputed <- combined_hurricanes_imputed %>%
+  rename(max_wind_speed = wind_speed.x,
+         wind_speed_radius = wind_speed.y) %>%
+  select(., -quadrant, -wind_radius, -year)
+
+# Imputing data using average value for that max_wind_speed
+averages <- combined_hurricanes_imputed %>%
+  group_by(max_wind_speed, wind_speed_radius) %>%
+  summarize(temp_mean = mean(avg_wind_radius, na.rm = TRUE)) %>%
+  filter(!is.na(max_wind_speed))
+averages <- averages %>%
+  group_by(wind_speed_radius) %>%
+  fill(temp_mean, .direction = 'down')
+
+# Use these averages to fill missing values in the combined hurricanes data
+combined_hurricanes_imputed <- combined_hurricanes_imputed %>%
+  left_join(averages, by = c('max_wind_speed', 'wind_speed_radius')) %>%
+  mutate(avg_wind_radius = if_else(is.na(avg_wind_radius), temp_mean, avg_wind_radius)) %>%
+  select(-temp_mean)  # Remove the helper column
+
 #'
 #' Reading/Cleaning Exposures data set
 #'
@@ -178,36 +253,10 @@ exposures <- exposures %>%
 
 write_csv(exposures, 'exposures.csv')
 
-exposures_id <- exposures %>%
-  filter(location_id == 1)
-
 #'
 #' Combining hurricane data
 #'
 
-combined_hurricanes <- inner_join(hurricanes_1, hurricanes_2, by = c("name", "date", "longitude", "latitude"))
-
-combined_hurricanes <- combined_hurricanes %>% distinct()
-
-summary(hurricanes_1)
-summary(hurricanes_2)
-summary(combined_hurricanes)
-
-write_csv(combined_hurricanes, "combined_hurricanes.csv")
-
-#'
-#' Creating the interactive map for huuricane 1 data
-#'
-
-#'
-#' Creating the interactive map for the hurricane 2 data
-#'
-
-hurricanes_2_average_wind_radius <- hurricanes_2 %>%
-  group_by(name, date, longitude, latitude, wind_speed) %>%
-  mutate(avg_wind_radius = mean(wind_radius)) %>%
-  ungroup() %>%
-  distinct(name, date, latitude, longitude, wind_speed, .keep_all = TRUE)
 
 #'
 #' Making a shiny ui for project
@@ -224,22 +273,31 @@ ui <- fluidPage(
           selectInput(
             "names", 
             "Select Hurricanes:",
-            choices = c('ALL Hurricanes', as.character(unique(hurricanes_2$name))),
+            choices = c('ALL Hurricanes', as.character(unique(combined_hurricanes_imputed$name))),
             multiple = TRUE
           ),
           sliderInput("year", 
                       "Select Years:",
-                      min = min(hurricanes_2$date), 
-                      max = max(hurricanes_2$date), 
-                      value = c(min(hurricanes_2$date), max(hurricanes_2$date))),
-          h4('Enter proposed location: '),
-          numericInput("longitude", "Longitude", value = 0),  # Default value for longitude
-          numericInput("latitude", "Latitude", value = 0),
-          actionButton("add_location", "Add Location"),
-          actionButton("clear_locations", "Clear Locations")
+                      min = min(combined_hurricanes_imputed$date), 
+                      max = max(combined_hurricanes_imputed$date), 
+                      value = c(min(combined_hurricanes_imputed$date), max(combined_hurricanes_imputed$date)),
+                      step = 365, 
+                      ticks = TRUE ),
+          h4('Choose Property'),
+          selectInput(
+            "propertyName",
+            "Select Property:",
+            choices = sort(as.numeric(unique(exposures$location_id)))
+          )
+          # h4('Enter proposed location: '),
+          # numericInput("longitude", "Longitude", value = 0),  # Default value for longitude
+          # numericInput("latitude", "Latitude", value = 0),
+          # actionButton("add_location", "Add Location"),
+          # actionButton("clear_locations", "Clear Locations")
         ),
         mainPanel(
-          leafletOutput("map")
+          leafletOutput("map1"),
+          plotOutput('losses_bar_chart')
         )
       )
     ),
@@ -268,21 +326,24 @@ ui <- fluidPage(
 # Define the server logic
 server <- function(input, output, session) {
   # Create the leaflet map and render it when the button is pressed
-  output$map <- renderLeaflet({
+  output$map1 <- renderLeaflet({
     if('ALL Hurricanes' %in% input$names) {
-      selected_data <- hurricanes_2_average_wind_radius
+      selected_data <- combined_hurricanes_imputed
     } else {
-      selected_data <- hurricanes_2_average_wind_radius %>%
+      selected_data <- combined_hurricanes_imputed %>%
         filter(name %in% input$names)
     }
     selected_data <- selected_data %>%
       filter(date >= input$year[1],
              date <= input$year[2])
     
+    exposures_id <- exposures %>%
+      filter(policy_year == 2021, location_id == input$propertyName)
+    
     leaflet(selected_data) %>%
       addTiles() %>% 
       addCircles(
-        data = selected_data %>% filter(wind_speed == 34),
+        data = selected_data %>% filter(wind_speed_radius == 34, avg_wind_radius != 0),
         lng = ~longitude,
         lat = ~latitude,
         radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
@@ -292,7 +353,7 @@ server <- function(input, output, session) {
         opacity = 0.3
       ) %>%
       addCircles(
-        data = selected_data %>% filter(wind_speed == 50),
+        data = selected_data %>% filter(wind_speed_radius == 50, avg_wind_radius != 0),
         lng = ~longitude, 
         lat = ~latitude, 
         radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
@@ -302,7 +363,7 @@ server <- function(input, output, session) {
         opacity = 0.3
       ) %>%
       addCircles(
-        data = selected_data %>% filter(wind_speed == 64),
+        data = selected_data %>% filter(wind_speed_radius == 64, avg_wind_radius != 0),
         lng = ~longitude, 
         lat = ~latitude, 
         radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
@@ -311,17 +372,27 @@ server <- function(input, output, session) {
         fillOpacity = 0.3,  # Opacity of the circle fill
         opacity = 0.3
       ) %>%
-      addTiles()
-      # %>%
-      # addCircleMarkers(
-      #   #clusterOptions = markerClusterOptions(),
-      #   lng = ~longitude,
-      #   lat = ~latitude,
-      #   label = ~name,
-      #   radius = 2,
-      #   color = 'red',
-      #   stroke = FALSE, fillOpacity = 1
-      # ) 
+      addTiles() %>%
+      addCircleMarkers(
+        lng = exposures_id$longitude,
+        lat = exposures_id$latitude,
+        label = input$propertyName,
+        radius = 6,
+        color = 'blue',
+        fillColor = 'blue',
+        stroke = FALSE, fillOpacity = 1
+      )
+  })
+  
+  output$losses_bar_chart <- renderPlot ({
+    exposures_cum <- exposures %>%
+      filter(policy_year == 2021)
+    ggplot(exposures_cum, aes(x = reorder(location_id, cum_loss_ratio), y = cum_loss_ratio, fill = ifelse(location_id == input$propertyName, "blue", "red"))) +
+      geom_bar(stat = "identity") +
+      scale_fill_identity() +  # Use the exact colors specified
+      labs(x = "Location ID", y = "Cumulative Loss Ratio", title = 'Loss Ration per Location') +
+      theme_minimal()
+    
   })
   
   # Adding Locations
@@ -382,8 +453,6 @@ server <- function(input, output, session) {
   })
   
 }
-
-
 
 # Run the application
 shinyApp(ui = ui, server = server)
