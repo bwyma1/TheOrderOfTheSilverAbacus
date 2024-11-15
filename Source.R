@@ -10,6 +10,7 @@ library(leaflet)
 library(sf)
 library(shiny)
 library(lubridate)
+library(geosphere)
 
 # Keep lat, long, date, wind speed, wind radius, year, iso_time
 # Keep wind speeds in km
@@ -141,6 +142,7 @@ ggplot(combined_hurricanes_64, aes(x = wind_speed.x, y = avg_wind_radius)) +
   theme_minimal()
 # There is no function that fits this data well.
 # This model shows that we should probably impute by taking the average for each max wind speed.
+rm(combined_hurricanes_34, combined_hurricanes_50, combined_hurricanes_64)
 
 # Combine using a full join
 combined_hurricanes <- hurricanes_1  %>%
@@ -182,6 +184,7 @@ combined_hurricanes_imputed <- combined_hurricanes_imputed %>%
 #'
 #' Reading/Cleaning Exposures data set
 #'
+
 exposures_raw = read_csv('Data/Exposures-Table 1.csv')
 exposures <- exposures_raw %>%
   rename(longitude = ...3,
@@ -216,16 +219,26 @@ duplicate_rows <- exposures %>%
   ungroup()
 
 # Adding column to exposures with the number of hurricanes within 1 degree of lat/lon of hurricane
+exposures_risky_hurricanes <- exposures %>%
+  full_join(hurricanes_1, by = c('policy_year' = 'year')) %>%
+  filter(abs(latitude.x - latitude.y) < 1 & abs(longitude.x - longitude.y) < 1) %>%
+  distinct(location_id, policy_year, longitude.x, latitude.x, name, .keep_all = TRUE) %>%
+  select(policy_year, location_id) %>%
+  group_by(policy_year, location_id) %>%
+  mutate(risky_hurricanes = n()) %>%
+  ungroup() %>%
+  distinct(location_id, policy_year, .keep_all = TRUE)
+
 exposures <- exposures %>%
-  rowwise() %>%
+  full_join(exposures_risky_hurricanes, by = c('policy_year', 'location_id')) %>%
+  mutate(risky_hurricanes = if_else(is.na(risky_hurricanes), 0, risky_hurricanes))
+
+# Creating a total nearby hurricane column
+exposures <- exposures %>%
+  arrange(location_id, policy_year) %>%
+  group_by(location_id) %>%
   mutate(
-    nearby_hurricanes =
-      hurricanes_1 %>%
-        filter(policy_year == .data$year) %>%
-        filter(abs(latitude - .data$latitude) < 1 & abs(longitude - .data$longitude) < 1) %>%
-        distinct(name, .keep_all = TRUE) %>%
-        nrow()
-    
+    cum_risky_hurricanes = cumsum(risky_hurricanes)
   ) %>%
   ungroup()
 
@@ -251,15 +264,48 @@ exposures <- exposures %>%
   ) %>%
   ungroup()
 
+
+#'
+#' Creating a column in exposures for approximate wind speeds each property
+#'
+
+chi_with_year <- combined_hurricanes_imputed %>%
+  mutate(year = year(date))
+
+exposures_wind_speeds <- exposures %>%
+  full_join(chi_with_year, by = c('policy_year' = 'year')) %>%
+  filter(avg_wind_radius != 0,
+         longitude.y > -180) %>%
+  mutate(avg_wind_radius = avg_wind_radius*1609.34*1.15078,
+         distance = distVincentySphere(cbind(longitude.x, latitude.x), cbind(longitude.y, latitude.y))) %>%
+  filter(distance < avg_wind_radius) %>%
+  mutate(probable_wind_speed = ifelse(wind_speed_radius == 34, ifelse(max_wind_speed > 34, max_wind_speed-((1-((avg_wind_radius-distance)/avg_wind_radius)) * (max_wind_speed-34)), 34),
+                                      ifelse(wind_speed_radius == 50, ifelse(max_wind_speed > 50, max_wind_speed-((1-((avg_wind_radius-distance)/avg_wind_radius)) * (max_wind_speed-50)), 50), 
+                                             ifelse(max_wind_speed > 64, max_wind_speed-((1-((avg_wind_radius-distance)/avg_wind_radius)) * (max_wind_speed-64)), 64)))) %>%
+  group_by(name, location_id, policy_year) %>%
+  slice_max(order_by = probable_wind_speed, n = 1) %>%
+  distinct(probable_wind_speed, name, location_id, policy_year, .keep_all = TRUE) %>%
+  ungroup() %>%
+  select(location_id, policy_year, probable_wind_speed)  %>%
+  group_by(location_id, policy_year) %>%
+  mutate(num_hurricanes_wind_speed = n(),
+         avg_wind_speed = mean(probable_wind_speed)) %>%
+  ungroup() %>%
+  distinct(location_id, policy_year, .keep_all = TRUE) %>%
+  select(-probable_wind_speed)
+
+exposures <- exposures %>%
+  full_join(exposures_wind_speeds, by = c('policy_year', 'location_id')) %>%
+  mutate(num_hurricanes_wind_speed = if_else(is.na(num_hurricanes_wind_speed), 0, num_hurricanes_wind_speed),
+         avg_wind_speed = if_else(is.na(avg_wind_speed), 0, avg_wind_speed))
+
+
+# Writing files to a csv for storage
 write_csv(exposures, 'exposures.csv')
+write_csv(combined_hurricanes_imputed, 'hurricanes.csv')
 
 #'
-#' Combining hurricane data
-#'
-
-
-#'
-#' Making a shiny ui for project
+#' Making an r shiny ui for project
 #'
 
 # Define ui
@@ -270,34 +316,42 @@ ui <- fluidPage(
       title = "Hurricane Map Display",
       sidebarLayout(
         sidebarPanel(
+          h4('Choose Hurricanes to View'),
           selectInput(
             "names", 
             "Select Hurricanes:",
             choices = c('ALL Hurricanes', as.character(unique(combined_hurricanes_imputed$name))),
             multiple = TRUE
           ),
-          sliderInput("year", 
-                      "Select Years:",
+          sliderInput("hurricane_year", 
+                      "Select Years For Hurricanes:",
                       min = min(combined_hurricanes_imputed$date), 
                       max = max(combined_hurricanes_imputed$date), 
                       value = c(min(combined_hurricanes_imputed$date), max(combined_hurricanes_imputed$date)),
                       step = 365, 
                       ticks = TRUE ),
-          h4('Choose Property'),
+          h4('Choose Property to View'),
           selectInput(
             "propertyName",
             "Select Property:",
             choices = sort(as.numeric(unique(exposures$location_id)))
-          )
-          # h4('Enter proposed location: '),
-          # numericInput("longitude", "Longitude", value = 0),  # Default value for longitude
-          # numericInput("latitude", "Latitude", value = 0),
-          # actionButton("add_location", "Add Location"),
-          # actionButton("clear_locations", "Clear Locations")
+          ),
+          sliderInput("property_year", 
+                      "Select Years For the Property:",
+                      min = min(exposures$policy_year), 
+                      max = max(exposures$policy_year), 
+                      value = c(min(exposures$policy_year), max(exposures$policy_year)),
+                      step = 1, 
+                      ticks = TRUE,
+                      sep = '')
         ),
         mainPanel(
+          uiOutput('risk_level'),
           leafletOutput("map1"),
-          plotOutput('losses_bar_chart')
+          plotOutput('losses_bar_chart'),
+          plotOutput('risky_hurricanes_bar_chart'),
+          plotOutput('windy_hurricanes_bar_chart'),
+          plotOutput('wind_speeds_bar_chart')
         )
       )
     ),
@@ -310,7 +364,15 @@ ui <- fluidPage(
             "propertyName",
             "Select Property:",
             choices = sort(as.numeric(unique(exposures$location_id)))
-          )
+          ),
+          sliderInput("property_year", 
+                      "Select Years For the Property:",
+                      min = min(exposures$policy_year), 
+                      max = max(exposures$policy_year), 
+                      value = c(min(exposures$policy_year), max(exposures$policy_year)),
+                      step = 1, 
+                      ticks = TRUE,
+                      sep = '')
         ),
         mainPanel(
           plotOutput('plot1'),
@@ -334,19 +396,30 @@ server <- function(input, output, session) {
         filter(name %in% input$names)
     }
     selected_data <- selected_data %>%
-      filter(date >= input$year[1],
-             date <= input$year[2])
+      filter(date >= input$hurricane_year[1],
+             date <= input$hurricane_year[2])
     
     exposures_id <- exposures %>%
       filter(policy_year == 2021, location_id == input$propertyName)
     
     leaflet(selected_data) %>%
       addTiles() %>% 
+      addRectangles(
+        data = selected_data %>% filter(wind_speed_radius == 34),
+        lng1 = ~longitude - 1,  
+        lat1 = ~latitude - 1,
+        lng2 = ~longitude + 1,
+        lat2 = ~latitude + 1,
+        color = '',
+        fillColor = "#43a3ff",  # Fill color of the circle
+        fillOpacity = 0.3,  # Opacity of the circle fill
+        opacity = 0.3
+      ) %>%
       addCircles(
         data = selected_data %>% filter(wind_speed_radius == 34, avg_wind_radius != 0),
         lng = ~longitude,
         lat = ~latitude,
-        radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
+        radius = ~avg_wind_radius*1609.34*1.15078,  # Set the radius of the circle (in meters)
         color = "",   # Circle color
         fillColor = "#4cff00",  # Fill color of the circle
         fillOpacity = 0.3,  # Opacity of the circle fill
@@ -356,7 +429,7 @@ server <- function(input, output, session) {
         data = selected_data %>% filter(wind_speed_radius == 50, avg_wind_radius != 0),
         lng = ~longitude, 
         lat = ~latitude, 
-        radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
+        radius = ~avg_wind_radius*1609.34*1.15078,  # Set the radius of the circle (in meters)
         color = "",   # Circle color
         fillColor = "#fffe21",  # Fill color of the circle
         fillOpacity = 0.3,  # Opacity of the circle fill
@@ -366,7 +439,7 @@ server <- function(input, output, session) {
         data = selected_data %>% filter(wind_speed_radius == 64, avg_wind_radius != 0),
         lng = ~longitude, 
         lat = ~latitude, 
-        radius = ~avg_wind_radius*1609.34,  # Set the radius of the circle (in meters)
+        radius = ~avg_wind_radius*1609.34*1.15078,  # Set the radius of the circle (in meters)
         color = "",   # Circle color
         fillColor = "#ff2121",  # Fill color of the circle
         fillOpacity = 0.3,  # Opacity of the circle fill
@@ -381,18 +454,125 @@ server <- function(input, output, session) {
         color = 'blue',
         fillColor = 'blue',
         stroke = FALSE, fillOpacity = 1
+      ) %>%
+      addLegend(
+        position = "topright",
+        colors = c("#43a3ff", "#4cff00", "#fffe21", '#ff2121'),
+        labels = c("Risky Hurricanes", "34-49 kts", "50-63 kts", "64+ kts"),
+        title = "Wind Speeds"
       )
+  })
+  
+  #Assess risk level
+  output$risk_level <- renderUI({
+    exposures_cum <- exposures %>%
+      arrange(location_id, policy_year) %>%
+      group_by(location_id) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2])) %>%
+      mutate(
+        cum_loss_ratio = cummean(losses_non_catastrophe)/cummean(premium) * 100,
+        cum_risky_hurricanes = cumsum(risky_hurricanes),
+        cum_windy_hurricanes = cumsum(num_hurricanes_wind_speed)
+      ) %>%
+      mutate(non_zero_cummean = if_else(avg_wind_speed != 0, avg_wind_speed, NA_real_)) %>%
+      mutate(cum_wind_speeds = cumsum(replace_na(non_zero_cummean, 0)) / 
+               cumsum(!is.na(non_zero_cummean))) %>%
+      select(-non_zero_cummean) %>%
+      mutate(cum_wind_speeds = replace_na(cum_wind_speeds, 0)) %>%
+      ungroup() %>%
+      filter(policy_year == input$property_year[2]) %>%
+      mutate(cum_loss_ratio = (cum_loss_ratio - min(cum_loss_ratio)) / (max(cum_loss_ratio) - min(cum_loss_ratio)),
+             cum_risky_hurricanes = (cum_risky_hurricanes - min(cum_risky_hurricanes)) / (max(cum_risky_hurricanes) - min(cum_risky_hurricanes)),
+             cum_windy_hurricanes = (cum_windy_hurricanes - min(cum_windy_hurricanes)) / (max(cum_windy_hurricanes) - min(cum_windy_hurricanes)),
+             cum_wind_speeds = (cum_wind_speeds - min(cum_wind_speeds)) / (max(cum_wind_speeds) - min(cum_wind_speeds))) %>%
+      filter(location_id == input$propertyName)
+    risk_number <- exposures_cum$cum_loss_ratio * 0.5 + exposures_cum$cum_wind_speeds * 0.25 + exposures_cum$cum_risky_hurricanes * 0.125 + exposures_cum$cum_windy_hurricanes * 0.125
+    if(risk_number < 0.4) {
+      tags$h3(style = paste("color:", '#1cce20', ";"), paste("Property ", input$propertyName, " is a Low Risk Property from  ", input$property_year[1], "-",  input$property_year[2]))
+    } else if (risk_number < 0.6) {
+      tags$h3(style = paste("color:", '#eea61b', ";"), paste("Property ", input$propertyName, " is a Medium Risk Property from  ", input$property_year[1], "-",  input$property_year[2]))
+    } else {
+      tags$h3(style = paste("color:", '#fb2525', ";"), paste("Property ", input$propertyName, " is a High Risk Property from  ", input$property_year[1], "-",  input$property_year[2]))
+    }
   })
   
   output$losses_bar_chart <- renderPlot ({
     exposures_cum <- exposures %>%
-      filter(policy_year == 2021)
+      arrange(location_id, policy_year) %>%
+      group_by(location_id) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2])) %>%
+      mutate(
+        cum_loss_ratio = cummean(losses_non_catastrophe)/cummean(premium) * 100
+      ) %>%
+      ungroup() %>%
+      filter(policy_year == input$property_year[2])
+    
     ggplot(exposures_cum, aes(x = reorder(location_id, cum_loss_ratio), y = cum_loss_ratio, fill = ifelse(location_id == input$propertyName, "blue", "red"))) +
       geom_bar(stat = "identity") +
       scale_fill_identity() +  # Use the exact colors specified
-      labs(x = "Location ID", y = "Cumulative Loss Ratio", title = 'Loss Ration per Location') +
+      labs(x = "Location ID", y = "Cumulative Loss Ratio", title = 'Loss Ratio per Location') +
       theme_minimal()
+  })
+  
+  output$risky_hurricanes_bar_chart <- renderPlot ({
+    exposures_cum <- exposures %>%
+      arrange(location_id, policy_year) %>%
+      group_by(location_id) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2])) %>%
+      mutate(
+        cum_risky_hurricanes = cumsum(risky_hurricanes)
+      ) %>%
+      ungroup() %>%
+      filter(policy_year == input$property_year[2])
     
+    ggplot(exposures_cum, aes(x = reorder(location_id, cum_risky_hurricanes), y = cum_risky_hurricanes, fill = ifelse(location_id == input$propertyName, "blue", "red"))) +
+      geom_bar(stat = "identity") +
+      scale_fill_identity() +  # Use the exact colors specified
+      labs(x = "Location ID", y = "Cumulative Risky Hurricanes", title = 'Risky Hurricanes per Location') +
+      theme_minimal()
+  })
+  
+  output$windy_hurricanes_bar_chart <- renderPlot ({
+    exposures_cum <- exposures %>%
+      arrange(location_id, policy_year) %>%
+      group_by(location_id) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2])) %>%
+      mutate(
+        cum_windy_hurricanes = cumsum(num_hurricanes_wind_speed)
+      ) %>%
+      ungroup() %>%
+      filter(policy_year == input$property_year[2])
+    
+    ggplot(exposures_cum, aes(x = reorder(location_id, cum_windy_hurricanes), y = cum_windy_hurricanes, fill = ifelse(location_id == input$propertyName, "blue", "red"))) +
+      geom_bar(stat = "identity") +
+      scale_fill_identity() +  # Use the exact colors specified
+      labs(x = "Location ID", y = "Cumulative Windy Hurricanes", title = 'Windy Hurricanes per Location') +
+      theme_minimal()
+  })
+  
+  output$wind_speeds_bar_chart <- renderPlot ({
+    exposures_cum <- exposures %>%
+      arrange(location_id, policy_year) %>%
+      group_by(location_id) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2])) %>%
+      mutate(non_zero_cummean = if_else(avg_wind_speed != 0, avg_wind_speed, NA_real_)) %>%
+      mutate(cum_wind_speeds = cumsum(replace_na(non_zero_cummean, 0)) / 
+               cumsum(!is.na(non_zero_cummean))) %>%
+      select(-non_zero_cummean) %>%
+      mutate(cum_wind_speeds = replace_na(cum_wind_speeds, 0)) %>%
+      ungroup() %>%
+      filter(policy_year == input$property_year[2])
+    
+    ggplot(exposures_cum, aes(x = reorder(location_id, cum_wind_speeds), y = cum_wind_speeds, fill = ifelse(location_id == input$propertyName, "blue", "red"))) +
+      geom_bar(stat = "identity") +
+      scale_fill_identity() +  # Use the exact colors specified
+      labs(x = "Location ID", y = "Wind Speed Avg (Kts)", title = 'Average Wind Speeds per Location') +
+      theme_minimal()
   })
   
   # Adding Locations
@@ -411,7 +591,9 @@ server <- function(input, output, session) {
   # Plotting Loss Ration Over Time
   output$plot1 <- renderPlot({
     exposures_id <- exposures %>%
-      filter(location_id == input$propertyName)
+      filter(location_id == input$propertyName) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2]))
     ggplot(exposures_id, aes(x = policy_year, y = cum_loss_ratio)) +
       geom_point() +
       geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
@@ -422,7 +604,9 @@ server <- function(input, output, session) {
   # Plotting the Total Insured Value Over Time
   output$plot2 <- renderPlot({
     exposures_id <- exposures %>%
-      filter(location_id == input$propertyName)
+      filter(location_id == input$propertyName) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2]))
     ggplot(exposures_id, aes(x = policy_year, y = total_insured_value)) +
       geom_point() +
       geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
@@ -433,7 +617,9 @@ server <- function(input, output, session) {
   # Plotting the Premium per 100$ of total insured value over time
   output$plot3 <- renderPlot({
     exposures_id <- exposures %>%
-      filter(location_id == input$propertyName)
+      filter(location_id == input$propertyName) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2]))
     ggplot(exposures_id, aes(x = policy_year, y = premium_per_100_total_insured_value)) +
       geom_point() +
       geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
@@ -444,7 +630,9 @@ server <- function(input, output, session) {
   # Plotting Change in loss cost over time
   output$plot4 <- renderPlot({
     exposures_id <- exposures %>%
-      filter(location_id == input$propertyName)
+      filter(location_id == input$propertyName) %>%
+      filter(policy_year >= as.numeric(input$property_year[1]),
+             policy_year <= as.numeric(input$property_year[2]))
     ggplot(exposures_id, aes(x = policy_year, y = cum_loss_cost_ratio)) +
       geom_point() +
       geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), color = "blue", se = FALSE) +
